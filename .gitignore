@@ -1,0 +1,45 @@
+# Built knowledge bases — too large and user-specific
+kb/
+
+# Session logs — private conversation history
+session_logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+*.whl
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv
+venv/
+env/
+
+# Secrets
+*.key
+secrets.json
+keys.json
+_session.json
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp

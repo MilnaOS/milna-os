@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "milna-os"
+version = "1.0.0"
+description = "BYOK multi-provider AI runtime. Your keys, your compute, your output."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["ai", "llm", "byok", "terminal", "assistant", "kilonova"]
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "httpx>=0.27.0",
+    "keyring>=25.0.0",
+    "rich>=13.0.0",
+    "tiktoken>=0.7.0",
+    "pyyaml>=6.0",
+    "pdfplumber>=0.11.0",
+]
+
+[project.scripts]
+milna = "milna:main_sync"
+
+[tool.setuptools]
+py-modules = ["milna"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kilonova*"]
