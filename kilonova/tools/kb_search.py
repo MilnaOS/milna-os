@@ -15,12 +15,60 @@ _MAX_CHARS   = 6000    # hard cap on injected context size
 
 def _load_index(topic: str, entity: str, kb_root: Path) -> list[dict]:
     path = kb_root / topic / 'entries' / entity / '_index.json'
-    if not path.exists():
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    # No index yet (ingest in progress) — load individual files directly
+    entity_dir = kb_root / topic / 'entries' / entity
+    if not entity_dir.exists():
         return []
-    try:
-        return json.loads(path.read_text(encoding='utf-8'))
-    except Exception:
-        return []
+    records = []
+    for f in entity_dir.glob('*.json'):
+        if f.name == '_index.json':
+            continue
+        try:
+            records.append(json.loads(f.read_text(encoding='utf-8')))
+        except Exception:
+            pass
+    return records
+
+
+def _collection_schema_names(kb_root: Path, topic: str) -> set[str]:
+    schemas_dir = kb_root / topic / 'schemas'
+    names: set[str] = set()
+    if schemas_dir.exists():
+        for sf in schemas_dir.glob('*.json'):
+            try:
+                if json.loads(sf.read_text(encoding='utf-8')).get('_collection'):
+                    names.add(sf.stem)
+            except Exception:
+                pass
+    return names
+
+
+def _count_entities(kb_root: Path, topic: str) -> dict[str, int]:
+    """Count records per entity type — works with or without _index.json."""
+    entries_root = kb_root / topic / 'entries'
+    if not entries_root.exists():
+        return {}
+    skip = _collection_schema_names(kb_root, topic)
+    counts = {}
+    for entity_dir in entries_root.iterdir():
+        if not entity_dir.is_dir():
+            continue
+        if entity_dir.name in skip:
+            continue
+        index = entity_dir / '_index.json'
+        if index.exists():
+            try:
+                counts[entity_dir.name] = len(json.loads(index.read_text(encoding='utf-8')))
+                continue
+            except Exception:
+                pass
+        counts[entity_dir.name] = sum(1 for f in entity_dir.glob('*.json') if f.name != '_index.json')
+    return counts
 
 
 def _fuzzy_match(term: str, target: str) -> bool:
@@ -73,14 +121,25 @@ def _format_record(record: dict) -> str:
     lines.append(header)
 
     fields = [
+        # Sarna-ingest schema names
+        ('class',        'Class'),
+        ('mass',         'Mass (t)'),
+        ('speed_kph',    'Speed (kph)'),
+        ('armor',        'Armor'),
+        ('engine',       'Engine'),
+        ('heat_sinks',   'Heat Sinks'),
+        ('cost',         'Cost (C-bills)'),
+        ('B.V_1.0',      'BV 1.0'),
+        ('B.V_2.0',      'BV 2.0'),
+        ('chassis',      'Chassis'),
+        ('model',        'Model'),
+        # Kilonova-derived schema names (DOT ingest)
         ('tonnage',      'Tonnage'),
-        ('weight_class', 'Class'),
+        ('weight_class', 'Weight Class'),
         ('walk_mp',      'Walk MP'),
         ('run_mp',       'Run MP'),
         ('jump_mp',      'Jump MP'),
-        ('speed_kph',    'Speed'),
         ('armor_total',  'Armor'),
-        ('heat_sinks',   'Heat Sinks'),
         ('battle_value', 'BV'),
         ('cost_cbills',  'Cost (C-bills)'),
         ('tech_base',    'Tech Base'),
@@ -89,6 +148,12 @@ def _format_record(record: dict) -> str:
         ('era',          'Era'),
         ('affiliation',  'Affiliation'),
         ('role',         'Role'),
+        # Weapon/equipment fields
+        ('damage',       'Damage'),
+        ('range',        'Range'),
+        ('heat',         'Heat'),
+        ('ammo_per_ton', 'Ammo/ton'),
+        ('type',         'Type'),
     ]
     for key, label in fields:
         val = record.get(key)
@@ -117,6 +182,9 @@ def _format_record(record: dict) -> str:
     return '\n'.join(lines)
 
 
+_COUNT_TERMS = {'how', 'many', 'count', 'total', 'number', 'list', 'all'}
+
+
 def search_kb(
     topic: str,
     query: str,
@@ -128,6 +196,17 @@ def search_kb(
     Returns a formatted context block ready for injection, or '' if nothing found.
     """
     root = kb_root or _DEFAULT_KB_ROOT
+
+    # Count query — "how many battlemechs", "total weapons", etc.
+    q_lower = query.lower()
+    if any(t in q_lower for t in _COUNT_TERMS):
+        counts = _count_entities(root, topic)
+        if counts:
+            lines = [f'## {topic.upper()} KB — Record Counts\n']
+            for entity, n in sorted(counts.items()):
+                lines.append(f'  {entity}: {n} records')
+            return '\n'.join(lines)
+
     terms = _tokenize(query)
     if not terms:
         return ''
@@ -136,12 +215,25 @@ def search_kb(
     if not entries_root.exists():
         return ''
 
+    # Load schema collection flags so we can skip prose buckets
+    schemas_dir = root / topic / 'schemas'
+    _collection_types: set[str] = set()
+    if schemas_dir.exists():
+        for sf in schemas_dir.glob('*.json'):
+            try:
+                s = json.loads(sf.read_text(encoding='utf-8'))
+                if s.get('_collection'):
+                    _collection_types.add(sf.stem)
+            except Exception:
+                pass
+
     # Determine which entity types to search
     if entity_types:
-        types_to_search = entity_types
+        types_to_search = [e for e in entity_types if e not in _collection_types]
     else:
         types_to_search = [
-            p.name for p in entries_root.iterdir() if p.is_dir()
+            p.name for p in entries_root.iterdir()
+            if p.is_dir() and p.name not in _collection_types
         ]
 
     # Score all records across all entity types

@@ -22,19 +22,23 @@ ROLE_PROMPTS: dict[str, str] = {
     ),
     'data_validity': (
         'You are the Data Validity role. Flag any claims in the isolate outputs '
-        'that appear hallucinated, unverifiable, or contradicted by other isolates.'
+        'that appear hallucinated, unverifiable, or contradicted by other isolates. '
+        'Only use this role for factual Q&A — not for design or synthesis tasks.'
     ),
     'notes_taker': (
-        'You are the Notes Taker. Your job is to write the final user-facing response.\n'
-        'You receive the analysis from the Coherence, Structure, Pattern Recognition, and Data Validity roles, '
-        'plus the raw isolate outputs for reference. Synthesize these into a direct, concise answer.\n'
-        'CRITICAL RULES:\n'
-        '1. If the analysis and isolates all indicate no information is available, respond only with: '
-        '"I don\'t have enough information to answer that." Do NOT invent content.\n'
-        '2. Answer ONLY the current question. Do NOT recap, reference, or repeat any prior turn.\n'
-        '3. Do NOT mention the analysis roles, the reconciler, or the pipeline. '
-        'Write as if you are a single, confident assistant giving a direct answer.\n'
-        'This is the final user-facing output — make it clean and complete.'
+        'You are the Notes Taker. Capture the isolate outputs quickly and faithfully.\n'
+        'Write down what each model said. Do not judge, filter, or confidence-gate.\n'
+        'Do not add "I don\'t have enough information" — that is not your job.\n'
+        'Your only job is fast, accurate capture of what was said.\n'
+        'NEVER generate simulated conversations, fake user prompts, or multi-turn dialogue. Write only your notes.'
+    ),
+    'curator': (
+        'You are the Curator. You receive all blocks from the analysis roles and notes taker.\n'
+        'Your job is to organize them into one coherent, well-structured final response.\n'
+        'Merge overlapping ideas. Preserve all distinct signal. Remove redundancy.\n'
+        'Write in clean markdown. Do NOT mention the roles, the pipeline, or the process.\n'
+        'Write as a single confident voice. This is the final user-facing output.\n'
+        'NEVER generate simulated conversations, fake user prompts, or multi-turn dialogue. One answer only.'
     ),
     'judge': (
         'You are the Judge. Score the quality of this set of isolate outputs '
@@ -103,8 +107,10 @@ class Reconciler:
         isolate_outputs: list[dict],  # [{'leg': 'anthropic', 'text': '...'}]
         conversation_context: str = '',
     ) -> dict[str, str]:
-        analysis_roles = [r for r in self.roles if r != 'notes_taker']
-        has_notes_taker = 'notes_taker' in self.roles
+        # Final-stage roles run after all analysis roles, reading their combined output
+        FINAL_ROLES = {'notes_taker', 'curator'}
+        analysis_roles = [r for r in self.roles if r not in FINAL_ROLES]
+        final_role = next((r for r in ('curator', 'notes_taker') if r in self.roles), None)
 
         # Stage 1: all analysis roles in parallel against raw isolates
         stage1_results = dict(await asyncio.gather(*[
@@ -112,12 +118,12 @@ class Reconciler:
             for role in analysis_roles
         ])) if analysis_roles else {}
 
-        # Stage 2: notes_taker reads the stage 1 analysis, not raw isolates
-        if has_notes_taker:
-            _, notes = await self._run_role(
-                'notes_taker', isolate_outputs, conversation_context,
+        # Stage 2: final role reads the stage 1 analysis blocks + raw isolates
+        if final_role:
+            _, output = await self._run_role(
+                final_role, isolate_outputs, conversation_context,
                 stage1_outputs=stage1_results if stage1_results else None,
             )
-            stage1_results['notes_taker'] = notes
+            stage1_results[final_role] = output
 
         return stage1_results

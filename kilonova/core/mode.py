@@ -1,6 +1,7 @@
 """
 Mode controller — potato / economy / standard / blade.
 Mode determines isolates-per-leg. Auto-detects hardware but user always wins.
+Blade mode requires a corporate license — enforced at set() time.
 """
 import subprocess
 from dataclasses import dataclass
@@ -63,9 +64,15 @@ def suggest_mode() -> str:
 
 
 class ModeController:
-    def __init__(self, mode_name: str | None = None):
-        suggested = suggest_mode()
-        self._mode = MODES.get(mode_name or suggested, MODES[suggested])
+    def __init__(self, mode_name: str | None = None, license=None):
+        from .license import License
+        self.license   = license or License()
+        suggested      = suggest_mode()
+        # Never auto-suggest blade — hardware detection doesn't imply license
+        if suggested == 'blade':
+            suggested = 'standard'
+        requested      = self.license.enforce_mode(mode_name or suggested)
+        self._mode     = MODES.get(requested, MODES[suggested])
         self.suggested = suggested
 
     @property
@@ -75,6 +82,12 @@ class ModeController:
     def set(self, name: str) -> None:
         if name not in MODES:
             raise ValueError(f'Unknown mode: {name}. Choose from: {list(MODES)}')
+        permitted = self.license.enforce_mode(name)
+        if permitted != name:
+            raise PermissionError(
+                f'Blade mode requires a corporate license. '
+                f'Contact sales@aimstudio.app to upgrade.'
+            )
         self._mode = MODES[name]
 
     def isolates_for(self, leg_count: int) -> int:

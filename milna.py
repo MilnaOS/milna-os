@@ -24,6 +24,7 @@ import re
 import sys
 import getpass
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from rich.table import Table
 from rich.text import Text
 
 from kilonova.core.legs import KeyInventory, LegRegistry, PROVIDER_DEFAULTS
+from kilonova.core.license import License
 from kilonova.tools.loader import load_file, list_folder, build_context_block, already_ingested
 from kilonova.tools.ingest import Ingestor
 from kilonova.tools.kb_tape import (
@@ -159,9 +161,15 @@ def show_mode(mc: ModeController) -> None:
 
 
 PROVIDER_MENU = {
-    '1': ('anthropic', 'Anthropic  (Claude)'),
-    '2': ('openai',    'OpenAI     (GPT-4o / GPT-4o-mini)'),
-    '3': ('gemini',    'Gemini     (Google)'),
+    '1': ('anthropic',  'Anthropic   (Claude)'),
+    '2': ('openai',     'OpenAI      (GPT-4o / GPT-4o-mini)'),
+    '3': ('gemini',     'Gemini      (Google)'),
+    '4': ('groq',       'Groq        (free tier — gpt-oss-120b)'),
+    '5': ('cerebras',   'Cerebras    (free tier — gpt-oss-120b)'),
+    '6': ('together',   'Together AI (free tier — Llama 3.3 70B)'),
+    '7': ('sambanova',  'SambaNova   (free tier — Llama 3.3 70B)'),
+    '8': ('openrouter', 'OpenRouter  (free models rotation)'),
+    '9': ('mistral',    'Mistral     (La Plateforme free tier)'),
 }
 
 
@@ -198,6 +206,7 @@ async def handle_command(
     registry: LegRegistry,
     mc: ModeController,
     engine: ConversationEngine,
+    license: License | None = None,
 ) -> tuple[bool, bool]:
     """Returns (handled, deep_next_turn)."""
     parts = cmd.strip().split()
@@ -219,6 +228,7 @@ async def handle_command(
             '  [cyan]/ingest --rebuild <topic>[/cyan] — rebuild schemas from existing raw docs\n'
             '  [cyan]/ingest --rebuild <topic> --force[/cyan] — wipe and re-extract all records\n'
             '  [cyan]/ingest --rebuild <topic> --force --deep[/cyan] — wipe, re-extract with deep distillation\n'
+            '  [cyan]/ingest --rebuild <topic> --overview-only[/cyan] — regenerate just the overview (fast)\n'
             '  [cyan]/kb[/cyan]                              — list available knowledge bases\n'
             '  [cyan]/kb <topic>[/cyan]                    — load KB into conversation as context anchor\n'
             '  [cyan]/kb <topic> tape <tag>[/cyan]         — mask a setting (e.g. wwii)\n'
@@ -232,7 +242,13 @@ async def handle_command(
             '  [cyan]/webseed <topic> <url> --entity <type>[/cyan] — extract one entity type only\n'
             '  [cyan]/webseed <topic> <url> --force[/cyan]        — ignore crawl state, re-fetch all URLs\n'
             '  [cyan]/webseed <topic> <url> --start-letter V[/cyan] — skip URLs before letter V\n'
+            '  [cyan]/curate <topic>[/cyan]               — run DOT curator: fill KB card gaps via batch API\n'
+            '  [cyan]/curate <topic> --model <id>[/cyan]  — use a specific model (default: haiku)\n'
+            '  [cyan]/backup[/cyan]                       — mirror KB + core files to OneDrive\n'
+            '  [cyan]/backup --kb[/cyan]                  — KB only (faster)\n'
+            '  [cyan]/backup --dry[/cyan]                 — preview what would be copied\n'
             '  [cyan]/keys[/cyan]          — add or list API keys\n'
+            '  [cyan]/license[/cyan]       — show tier or activate a license key\n'
             '  [cyan]/bench[/cyan]          — show model roster (active vs benched)\n'
             '  [cyan]/bench <model>[/cyan]  — toggle model between active and bench\n'
             '  [cyan]/ollama[/cyan]         — list Ollama models\n'
@@ -269,6 +285,22 @@ async def handle_command(
         else:
             console.print('[dim]No keys stored yet.[/dim]')
         add_key_flow(inventory)
+        registry.build()
+        console.print('[dim]Legs rebuilt — new key is now active.[/dim]')
+        return True, False
+
+    if name == '/license':
+        console.print(f'\n[bold]License:[/bold] {license.summary()}')
+        if license.tier == 'free':
+            console.print('[dim]To activate: /license <your-key>[/dim]')
+            console.print('[dim]Individual unlock ($700): aimstudio.app/unlock[/dim]')
+            console.print('[dim]Corporate (blade mode): sales@aimstudio.app[/dim]')
+        elif len(parts) > 1:
+            raw_key = parts[1]
+            tier = license.store_key(raw_key)
+            registry.build()
+            mc.license = license
+            console.print(f'[green]License activated: {tier.upper()}[/green]')
         return True, False
 
     if name == '/deep':
@@ -338,14 +370,30 @@ async def handle_command(
             if not rebuild_topic:
                 console.print('[red]Usage: /ingest --rebuild <topic>[/red]')
                 return True, False
-            rebuild_deep  = '--deep'  in parts
-            rebuild_force = '--force' in parts
+            rebuild_deep         = '--deep'         in parts
+            rebuild_force        = '--force'        in parts
+            rebuild_overview_only = '--overview-only' in parts
+
+            ingestor = Ingestor(engine, kb_root=KB_ROOT)
+
+            if rebuild_overview_only:
+                console.print(f'\n[cyan]Rebuilding overview for DOT: {rebuild_topic}[/cyan]\n')
+                with Progress(SpinnerColumn(), TextColumn('[bold cyan]{task.description}[/bold cyan]'), console=console) as progress:
+                    task = progress.add_task(f'Synthesizing {rebuild_topic} overview...', total=None)
+                    def _prog(msg):
+                        progress.console.print(f'  [dim cyan]{msg}[/dim cyan]')
+                    summary = await ingestor.rebuild_overview_only(rebuild_topic, progress_cb=_prog)
+                if not summary['ok']:
+                    console.print(f'[red]Overview rebuild failed: {summary.get("error")}[/red]')
+                else:
+                    console.print(f'\n[bold green]Overview rebuilt from {summary["docs"]} raw docs.[/bold green]')
+                return True, False
+
             mode_note = ''.join([
                 '  [cyan][deep][/cyan]'  if rebuild_deep  else '',
                 '  [cyan][force][/cyan]' if rebuild_force else '',
             ])
             console.print(f'\n[cyan]Rebuilding schemas and entities for DOT: {rebuild_topic}[/cyan]{mode_note}\n')
-            ingestor = Ingestor(engine, kb_root=KB_ROOT)
             with Progress(
                 SpinnerColumn(),
                 TextColumn('[bold cyan]{task.description}[/bold cyan]'),
@@ -734,11 +782,11 @@ async def handle_command(
             console.print('[dim]Usage: /webseed <topic> <url> [--follow] [--depth <n>] [--limit <n>] [--entity <type>][/dim]')
             return True, False
 
-        seed_topic   = non_flag[0]
-        seed_url     = non_flag[1]
-        follow       = '--follow' in parts
-        force        = '--force'  in parts
-        start_letter = None
+        seed_topic    = non_flag[0]
+        seed_urls     = non_flag[1:]   # one or more seed URLs — processed sequentially
+        follow        = '--follow' in parts
+        force         = '--force'  in parts
+        start_letter  = None
         if '--start-letter' in parts:
             idx = parts.index('--start-letter')
             if idx + 1 < len(parts):
@@ -761,15 +809,11 @@ async def handle_command(
         elif follow:
             depth = 1  # --follow is shorthand for --depth 1
 
-        console.print(f'\n[bold cyan]WebSeed:[/bold cyan] {seed_topic} ← {seed_url}')
-        if depth > 0:
-            console.print(f'[dim]BFS crawl depth {depth}, limit {limit} pages[/dim]')
-
-        # KB dir must be established before BFS so we can load crawl state
-        kb_dir = KB_ROOT / seed_topic
-
-        # Load persisted crawl state so resumed runs skip already-visited URLs
+        # ── One-time setup: KB dir, crawl state, schemas ──────────────────────
+        kb_dir     = KB_ROOT / seed_topic
         state_path = kb_dir / '_crawl_state.json'
+
+        # Crawl state is shared across all seed URLs so pages are never re-visited
         crawl_state: dict = {}
         if state_path.exists():
             try:
@@ -777,47 +821,12 @@ async def handle_command(
             except Exception:
                 crawl_state = {}
         already_visited: set[str] = set() if force else set(crawl_state.get('visited', []))
-        if already_visited:
-            console.print(f'[dim]Resuming — {len(already_visited)} URLs already visited[/dim]')
-        elif force and crawl_state:
+        if force and crawl_state:
             console.print(f'[dim]--force: clearing crawl state, starting fresh[/dim]')
             crawl_state = {}
+        elif already_visited:
+            console.print(f'[dim]Resuming — {len(already_visited)} URLs already visited[/dim]')
 
-        # BFS URL collection up to --depth levels
-        urls_to_fetch: list[str] = []
-        if depth > 0:
-            visited: set[str] = set(already_visited)  # seed from persisted state
-            queue: list[tuple[str, int]] = [(seed_url, depth)]
-            with console.status('[cyan]Crawling...[/cyan]', spinner='dots') as status:
-                while queue and len(urls_to_fetch) < limit:
-                    url, remaining = queue.pop(0)
-                    if url in visited:
-                        continue
-                    visited.add(url)
-                    urls_to_fetch.append(url)
-                    status.update(f'[cyan]Crawling... {len(urls_to_fetch)} URLs found[/cyan]')
-                    if remaining > 0:
-                        raw = fetch_url_raw_html(url)
-                        if raw['ok']:
-                            links = extract_links(url, raw['html'])
-                            for link in links:
-                                if link not in visited:
-                                    queue.append((link, remaining - 1))
-            console.print(f'[dim]Crawled {len(urls_to_fetch)} URLs (depth {depth})[/dim]')
-        else:
-            if seed_url in already_visited and not force:
-                console.print(f'[dim]Already visited {seed_url} — nothing to do. Use --force to re-fetch.[/dim]')
-                return True, False
-            urls_to_fetch = [seed_url]
-
-        # Filter to starting letter if requested (applies to both BFS and single-URL)
-        if start_letter and urls_to_fetch:
-            before = len(urls_to_fetch)
-            urls_to_fetch = [
-                u for u in urls_to_fetch
-                if u.split('/')[-1][:1].upper() >= start_letter
-            ]
-            console.print(f'[dim]--start-letter {start_letter}: {before - len(urls_to_fetch)} URLs skipped, {len(urls_to_fetch)} remaining[/dim]')
         schema_dir = kb_dir / 'schemas'
         if not schema_dir.exists():
             console.print(f'[yellow]No DOT found for topic: {seed_topic} — creating now...[/yellow]')
@@ -865,99 +874,383 @@ async def handle_command(
                 return True, False
             schemas = {entity_filter: schemas[entity_filter]}
 
+        # Batch header
+        if len(seed_urls) > 1:
+            console.print(f'\n[bold cyan]WebSeed batch:[/bold cyan] {seed_topic} — {len(seed_urls)} seeds, depth {depth}, limit {limit}/seed')
         console.print(f'[dim]Extracting {len(schemas)} entity type(s) — rolling inject → extract → append[/dim]\n')
 
-        ingestor = Ingestor(engine, kb_root=KB_ROOT)
-        total_new   = 0
-        pages_hit   = 0
-
+        ingestor    = Ingestor(engine, kb_root=KB_ROOT)
+        grand_total = 0
+        grand_pages = 0
         interrupted = False
+        stop_requested = threading.Event()
+
+        def _watch_for_q():
+            try:
+                import msvcrt
+                while not stop_requested.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b'q', b's', b'Q', b'S'):
+                            console.print(
+                                '\n[yellow]Wrap-up signal — finishing current page then stopping.[/yellow]')
+                            stop_requested.set()
+                            return
+                    import time; time.sleep(0.1)
+            except Exception:
+                pass
+
+        q_watcher = threading.Thread(target=_watch_for_q, daemon=True)
+        q_watcher.start()
+
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn('[bold cyan]{task.description}[/bold cyan]'),
-                BarColumn(bar_width=30),
-                TaskProgressColumn(),
-                TextColumn('[dim]{task.fields[label]}[/dim]'),
-                console=console,
-            ) as progress:
-                page_task = progress.add_task('WebSeed', total=len(urls_to_fetch), label='')
+            for si, seed_url in enumerate(seed_urls):
+                if interrupted:
+                    break
 
-                for url in urls_to_fetch:
-                    page_name = url.split('/')[-1][:35] or url[:35]
-                    progress.update(page_task, label=f'fetching {page_name}')
+                # ── BFS discovery for this seed URL ──────────────────────────
+                if len(seed_urls) > 1:
+                    console.print(f'\n[cyan][{si+1}/{len(seed_urls)}] {seed_url}[/cyan]')
+                else:
+                    console.print(f'\n[bold cyan]WebSeed:[/bold cyan] {seed_topic} ← {seed_url}')
+                    if depth > 0:
+                        console.print(f'[dim]BFS crawl depth {depth}, limit {limit} pages[/dim]')
 
-                    result = fetch_url(url)
-                    if not result['ok']:
-                        progress.console.print(f'  [yellow]Skip {url}: {result["error"]}[/yellow]')
-                        progress.update(page_task, advance=1)
+                urls_to_fetch: list[str] = []
+                if depth > 0:
+                    bfs_seen: set[str] = set()
+                    discovered: list[str] = []
+                    queue: list[tuple[str, int]] = [(seed_url, depth)]
+                    discovery_cap = limit * 4
+                    with console.status('[cyan]Crawling...[/cyan]', spinner='dots') as status:
+                        while queue:
+                            url, remaining = queue.pop(0)
+                            if url in bfs_seen:
+                                continue
+                            bfs_seen.add(url)
+                            discovered.append(url)
+                            status.update(f'[cyan]Crawling... {len(discovered)} URLs found[/cyan]')
+                            if len(discovered) >= discovery_cap:
+                                break
+                            if remaining > 0:
+                                raw = fetch_url_raw_html(url)
+                                if raw['ok']:
+                                    links = extract_links(url, raw['html'])
+                                    for link in links:
+                                        if link not in bfs_seen:
+                                            queue.append((link, remaining - 1))
+                    urls_to_fetch = [u for u in discovered if u not in already_visited][:limit]
+                    console.print(f'[dim]Crawled {len(discovered)} URLs (depth {depth}), '
+                                  f'{len(already_visited)} already visited, '
+                                  f'{len(urls_to_fetch)} to fetch[/dim]')
+                else:
+                    if seed_url in already_visited and not force:
+                        console.print(f'[dim]Already visited — skipping. Use --force to re-fetch.[/dim]')
                         continue
+                    urls_to_fetch = [seed_url]
 
-                    pages_hit += 1
-                    page_text = result['text']
+                if start_letter and urls_to_fetch:
+                    before = len(urls_to_fetch)
+                    urls_to_fetch = [
+                        u for u in urls_to_fetch
+                        if u.split('/')[-1][:1].upper() >= start_letter
+                    ]
+                    console.print(f'[dim]--start-letter {start_letter}: {before - len(urls_to_fetch)} skipped, {len(urls_to_fetch)} remaining[/dim]')
 
-                    # Extract each entity type from this page and append to DOT
-                    page_new = 0
-                    for entity_type, schema_def in schemas.items():
-                        progress.update(page_task, label=f'{page_name} → {entity_type}')
+                if not urls_to_fetch:
+                    console.print('[dim]No new URLs — skipping seed.[/dim]')
+                    continue
 
-                        records = await ingestor._extract_entities(
-                            entity_type, schema_def, page_text
-                        )
-                        if not isinstance(records, list) or not records:
+                total_new = 0
+                pages_hit = 0
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn('[bold cyan]{task.description}[/bold cyan]'),
+                    BarColumn(bar_width=30),
+                    TaskProgressColumn(),
+                    TextColumn('[dim]{task.fields[label]}[/dim]'),
+                    console=console,
+                ) as progress:
+                    page_task = progress.add_task('WebSeed', total=len(urls_to_fetch), label='')
+                    progress.console.print('[dim]  Press [bold]Q[/bold] or [bold]S[/bold] to wrap up and save progress[/dim]')
+
+                    for url in urls_to_fetch:
+                        if stop_requested.is_set():
+                            interrupted = True
+                            break
+                        page_name = url.split('/')[-1][:35] or url[:35]
+                        progress.update(page_task, label=f'fetching {page_name}')
+
+                        result = fetch_url(url)
+                        if not result['ok']:
+                            err = result['error']
+                            if 'Skipped binary' in err:
+                                progress.console.print(f'  [dim]Skip {page_name}: {err}[/dim]')
+                            else:
+                                progress.console.print(f'  [yellow]Skip {url}: {err}[/yellow]')
+                            already_visited.add(url)
+                            crawl_state['visited'] = list(already_visited)
+                            state_path.write_text(_json.dumps(crawl_state, indent=2), encoding='utf-8')
+                            progress.update(page_task, advance=1)
                             continue
 
-                        # Load existing index, append new records, write back immediately
-                        entity_dir = kb_dir / 'entries' / entity_type
-                        entity_dir.mkdir(parents=True, exist_ok=True)
-                        index_path = entity_dir / '_index.json'
-                        existing = _json.loads(index_path.read_text(encoding='utf-8')) \
-                            if index_path.exists() else []
-                        existing_names = {r.get('name') or r.get('id') for r in existing}
+                        pages_hit += 1
+                        page_text = result['text']
 
-                        new_recs = [
-                            r for r in records
-                            if (r.get('name') or r.get('id')) not in existing_names
-                        ]
-                        if not new_recs:
-                            continue
+                        prose_schema = schemas.get('research_prose', {})
+                        if prose_schema.get('_collection'):
+                            prose_dir = kb_dir / 'entries' / 'research_prose'
+                            prose_dir.mkdir(parents=True, exist_ok=True)
+                            import hashlib as _hashlib
+                            url_hash = _hashlib.md5(url.encode()).hexdigest()[:12]
+                            prose_path = prose_dir / f'{url_hash}.json'
+                            if not prose_path.exists():
+                                title_line = page_text.splitlines()[0][:120] if page_text else ''
+                                prose_path.write_text(_json.dumps({
+                                    'url':   url,
+                                    'title': title_line,
+                                    'text':  page_text,
+                                }, indent=2), encoding='utf-8')
 
-                        all_recs = existing + new_recs
-                        for r in new_recs:
-                            rname = r.get('name') or r.get('id') or 'record'
-                            safe  = re.sub(r'[^\w\-]', '_', str(rname).lower())[:64]
-                            (entity_dir / f'{safe}.json').write_text(
-                                _json.dumps(r, indent=2), encoding='utf-8'
+                        page_new      = 0
+                        page_enriched = 0
+                        page_type_hits: dict[str, int] = {}
+
+                        active_legs   = engine.registry.active_legs()
+                        extract_types = [(et, sd) for et, sd in schemas.items()
+                                         if not sd.get('_collection')]
+
+                        progress.update(page_task, label=f'{page_name} → extracting {len(extract_types)} types')
+
+                        async def _extract_for_type(entity_type, schema_def, leg):
+                            import json as _ejson
+                            from kilonova.tools.ingest import (
+                                EXTRACT_SYSTEM, EXTRACT_PREFIX, EXTRACT_SUFFIX,
+                                _parse_json_safe, _deduplicate,
                             )
-                        index_path.write_text(_json.dumps(all_recs, indent=2), encoding='utf-8')
+                            from kilonova.tools.kb_tape import tag_setting
+                            _CHUNK      = 14000
+                            _OVERLAP    = 1000
+                            _MAX_CHUNKS = 8
+                            _TIMEOUT    = 60
+                            chunks, pos = [], 0
+                            while pos < len(page_text) and len(chunks) < _MAX_CHUNKS:
+                                chunks.append(page_text[pos:pos + _CHUNK])
+                                pos += _CHUNK - _OVERLAP
+                                if pos >= len(page_text):
+                                    break
+                            prefix = EXTRACT_PREFIX.format(
+                                entity_type=entity_type,
+                                schema=_ejson.dumps(schema_def, indent=2),
+                            )
+                            all_recs = []
+                            for chunk in chunks:
+                                prompt = prefix + EXTRACT_SUFFIX.format(text=chunk)
+                                try:
+                                    text = await asyncio.wait_for(
+                                        leg.provider.complete(
+                                            leg.model, EXTRACT_SYSTEM,
+                                            [{'role': 'user', 'content': prompt}]
+                                        ),
+                                        timeout=_TIMEOUT,
+                                    )
+                                except Exception:
+                                    continue
+                                found = _parse_json_safe(text or '', default=[])
+                                if isinstance(found, list):
+                                    for r in found:
+                                        if isinstance(r, dict):
+                                            if 'setting' not in r:
+                                                r['setting'] = tag_setting(r)
+                                            all_recs.append(r)
+                            return entity_type, _deduplicate(all_recs)
 
-                        page_new   += len(new_recs)
-                        total_new  += len(new_recs)
+                        def _is_local_ollama(leg):
+                            return leg.name.startswith('ollama') and ':cloud' not in leg.model.lower()
 
-                    # Persist this URL as visited immediately — survives Ctrl+C
-                    already_visited.add(url)
-                    crawl_state['visited'] = list(already_visited)
-                    crawl_state['last_updated'] = __import__('datetime').datetime.utcnow().isoformat()
-                    state_path.write_text(_json.dumps(crawl_state, indent=2), encoding='utf-8')
+                        fast_legs    = [l for l in active_legs if not _is_local_ollama(l)]
+                        extract_legs = fast_legs if fast_legs else active_legs
 
-                    progress.update(page_task, advance=1,
-                                    label=f'{page_name} +{page_new} records')
+                        tasks = [
+                            _extract_for_type(et, sd, extract_legs[i % len(extract_legs)])
+                            for i, (et, sd) in enumerate(extract_types)
+                        ] if extract_legs else []
+
+                        type_results: dict[str, list] = {}
+                        if tasks:
+                            gathered     = await asyncio.gather(*tasks)
+                            type_results = {et: recs for et, recs in gathered}
+
+                        for entity_type, records in type_results.items():
+                            found = len(records)
+                            page_type_hits[entity_type] = found
+                            if not found:
+                                continue
+
+                            entity_dir = kb_dir / 'entries' / entity_type
+                            entity_dir.mkdir(parents=True, exist_ok=True)
+                            index_path = entity_dir / '_index.json'
+                            existing   = _json.loads(index_path.read_text(encoding='utf-8')) \
+                                if index_path.exists() else []
+
+                            def _canon(r):
+                                return (r.get('name') or r.get('id') or '').strip().lower()
+
+                            existing_map = {_canon(r): (i, r) for i, r in enumerate(existing)}
+
+                            new_recs = []
+                            for rec in records:
+                                key = _canon(rec)
+                                if not key:
+                                    continue
+                                if key in existing_map:
+                                    idx, old = existing_map[key]
+                                    changed  = False
+                                    for field, val in rec.items():
+                                        if field in ('name', 'id'):
+                                            continue
+                                        old_val = old.get(field)
+                                        if isinstance(val, list) and isinstance(old_val, list):
+                                            additions = [v for v in val if v not in old_val]
+                                            if additions:
+                                                old[field] = old_val + additions
+                                                changed = True
+                                        elif not old_val and val:
+                                            old[field] = val
+                                            changed = True
+                                    if changed and idx < len(existing):
+                                        existing[idx] = old
+                                        rname = old.get('name') or old.get('id') or 'record'
+                                        safe  = re.sub(r'[^\w\-]', '_', str(rname).lower())[:64]
+                                        (entity_dir / f'{safe}.json').write_text(
+                                            _json.dumps(old, indent=2), encoding='utf-8')
+                                        page_enriched += 1
+                                else:
+                                    new_recs.append(rec)
+                                    existing_map[key] = (len(existing) + len(new_recs) - 1, rec)
+
+                            all_recs = existing + new_recs
+                            if new_recs or page_enriched:
+                                for r in new_recs:
+                                    rname = r.get('name') or r.get('id') or 'record'
+                                    safe  = re.sub(r'[^\w\-]', '_', str(rname).lower())[:64]
+                                    (entity_dir / f'{safe}.json').write_text(
+                                        _json.dumps(r, indent=2), encoding='utf-8')
+                                index_path.write_text(_json.dumps(all_recs, indent=2), encoding='utf-8')
+
+                            page_new  += len(new_recs)
+                            total_new += len(new_recs)
+
+                        hit_parts = [f'{k}:{v}' for k, v in page_type_hits.items() if v > 0]
+                        if hit_parts:
+                            progress.console.print(f'  [dim green]{page_name}: {", ".join(hit_parts)}[/dim green]')
+                        else:
+                            alive_names = ', '.join(l.name for l in active_legs) if active_legs else 'none'
+                            progress.console.print(f'  [dim yellow]{page_name}: 0 records — active legs: {alive_names}[/dim yellow]')
+
+                        already_visited.add(url)
+                        crawl_state['visited']      = list(already_visited)
+                        crawl_state['last_updated'] = __import__('datetime').datetime.utcnow().isoformat()
+                        state_path.write_text(_json.dumps(crawl_state, indent=2), encoding='utf-8')
+
+                        label_parts = []
+                        if page_new:      label_parts.append(f'+{page_new} new')
+                        if page_enriched: label_parts.append(f'~{page_enriched} filled')
+                        progress.update(page_task, advance=1,
+                                        label=f'{page_name} {" · ".join(label_parts) or "(no data)"}')
+
+                grand_total += total_new
+                grand_pages += pages_hit
+                if len(seed_urls) > 1:
+                    console.print(f'[dim]  Seed {si+1}/{len(seed_urls)}: {total_new} new records, {pages_hit} pages[/dim]')
 
         except KeyboardInterrupt:
             interrupted = True
+        finally:
+            stop_requested.set()
 
-        # Restore clean engine state
         engine.reset()
 
         status_line = '[yellow]WebSeed stopped.[/yellow]' if interrupted else '[bold green]WebSeed complete.[/bold green]'
         console.print(f'\n{status_line}')
-        console.print(f'  Pages fetched:  {pages_hit}')
-        console.print(f'  New records:    {total_new}')
+        if len(seed_urls) > 1:
+            console.print(f'  Seeds processed: {si+1}/{len(seed_urls)}')
+            console.print(f'  Total pages:     {grand_pages}')
+            console.print(f'  Total new:       {grand_total}')
+        else:
+            console.print(f'  Pages fetched:  {grand_pages}')
+            console.print(f'  New records:    {grand_total}')
         console.print(f'  DOT:            kb/{seed_topic}')
         if interrupted:
             console.print(f'[dim]Progress saved ({len(already_visited)} URLs visited). Run the same /webseed command to resume.[/dim]\n')
         else:
             console.print(f'[dim]Use /kb {seed_topic} to load the updated DOT.[/dim]\n')
+        return True, False
+
+    if name == '/curate':
+        # /curate <topic> [--model <model_id>] [--batch-size <n>]
+        import sys
+        sys.path.insert(0, str(Path('D:/shard-accelerator')))
+        from core.dot_curator import DOTCurator
+        import anthropic as _anthropic
+
+        non_flag = [p for p in parts[1:] if not p.startswith('--')]
+        if not non_flag:
+            console.print('[dim]Usage: /curate <topic> [--model <id>] [--batch-size <n>][/dim]')
+            return True, False
+
+        curate_topic = non_flag[0]
+        curate_model = 'claude-haiku-4-5-20251014'
+        curate_batch  = 50
+        for i, p in enumerate(parts):
+            if p == '--model' and i + 1 < len(parts):     curate_model = parts[i + 1]
+            if p == '--batch-size' and i + 1 < len(parts): curate_batch = int(parts[i + 1])
+
+        api_key = engine.legs.get_key('anthropic') if hasattr(engine, 'legs') else os.environ.get('ANTHROPIC_API_KEY', '')
+        if not api_key:
+            console.print('[yellow]No Anthropic API key found — /curate requires one.[/yellow]')
+            return True, False
+
+        async_client = _anthropic.AsyncAnthropic(api_key=api_key)
+
+        console.print(f'\n[bold cyan]DOT Curator:[/bold cyan] {curate_topic}')
+        console.print(f'[dim]Model: {curate_model} · Batch size: {curate_batch}[/dim]\n')
+
+        curator = DOTCurator(
+            client=async_client,
+            kb_root=KB_ROOT,
+            topic=curate_topic,
+            model=curate_model,
+            batch_size=curate_batch,
+            log=lambda msg: console.print(f'[dim]{msg}[/dim]'),
+        )
+
+        stats = await curator.run()
+        console.print(f'\n[bold green]Curation complete.[/bold green]')
+        console.print(f'  Gaps found:  {stats["gaps_found"]}')
+        console.print(f'  Filled:      {stats["filled"]}')
+        console.print(f'  Batches:     {stats["batches"]}')
+        if stats["errors"]:
+            console.print(f'  [yellow]Errors:      {stats["errors"]}[/yellow]')
+        console.print(f'[dim]Use /kb {curate_topic} to load the enriched DOT.[/dim]\n')
+        return True, False
+
+    if name == '/backup':
+        kb_only = '--kb' in parts
+        dry     = '--dry' in parts
+        import importlib.util, sys as _sys
+        _spec = importlib.util.spec_from_file_location('backup', Path('D:/Runtime/backup.py'))
+        _mod  = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        prefix = '[DRY RUN] ' if dry else ''
+        console.print(f'[dim]{prefix}Backing up Runtime → OneDrive...[/dim]')
+        result = _mod.run(kb_only=kb_only, dry=dry)
+        if result['ok']:
+            label = 'Would copy' if dry else 'Done'
+            console.print(f'[bold green]{label}:[/bold green] {result["files"]} files, {result["kb"]} KB')
+        else:
+            console.print(f'[red]Backup failed: {result["error"]}[/red]')
         return True, False
 
     if name == '/bench':
@@ -1022,6 +1315,7 @@ async def chat_loop(
     mc: ModeController,
     logger: SessionLogger,
     resume_kb: str | None = None,
+    license: License | None = None,
 ) -> None:
     deep_next  = False
     active_kb  = resume_kb
@@ -1048,7 +1342,7 @@ async def chat_loop(
         if user_input.startswith('/'):
             try:
                 handled, set_deep = await handle_command(
-                    user_input, inventory, registry, mc, engine)
+                    user_input, inventory, registry, mc, engine, license=license)
             except (KeyboardInterrupt, Exception) as e:
                 if isinstance(e, KeyboardInterrupt):
                     console.print('\n[yellow]Interrupted — returning to prompt.[/yellow]')
@@ -1072,9 +1366,7 @@ async def chat_loop(
         deep_this_turn = deep_next
         deep_next = False
 
-        # If a KB is active, search it and build a grounding system prompt
         # If a KB is active, inject matching records into the user message.
-        # Keeps the system prompt as MILNA_SYSTEM so small models aren't overwhelmed.
         turn_input = user_input
         if active_kb:
             kb_context = search_kb(active_kb, user_input, kb_root=KB_ROOT)
@@ -1087,38 +1379,64 @@ async def chat_loop(
                     f'[QUESTION]\n{user_input}'
                 )
 
-        with console.status(
-            '[cyan]Kilonova firing...[/cyan]', spinner='dots', spinner_style='cyan'
-        ):
-            result = await engine.turn(turn_input, system=None, deep=deep_this_turn)
+        result = None
+
+        if deep_this_turn:
+            # Deep mode: multi-round distillation with spinner + Panel
+            with console.status(
+                '[cyan]Kilonova deep distillation...[/cyan]', spinner='dots', spinner_style='cyan'
+            ):
+                result = await engine.turn(turn_input, system=None, deep=True)
+            mode_tag = '[deep] '
+            console.print(Panel(
+                result.response,
+                title=f'[bold green]MILNA  {mode_tag}[/bold green]'
+                      f'[dim]{result.elapsed_ms}ms  ~{result.token_estimate} tokens[/dim]',
+                border_style='green',
+                padding=(1, 2),
+            ))
+            console.print()
+        else:
+            # Standard mode: stream tokens live, Claude Code style
+            console.print()
+            console.print('[bold green]MILNA[/bold green]')
+            console.print()
+            try:
+                async for chunk in engine.stream_turn(turn_input):
+                    if isinstance(chunk, str):
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                    else:
+                        result = chunk
+            except KeyboardInterrupt:
+                console.print('\n[yellow]Interrupted.[/yellow]')
+                engine.reset()
+                continue
+            console.print()
+            if result:
+                mode_tag = '[pipeline] ' if result.pipeline else ''
+                if result.dead_legs:
+                    console.print(
+                        f'\n[yellow]Leg(s) dropped: {", ".join(result.dead_legs)}[/yellow]'
+                    )
+                console.print(
+                    f'\n[dim]──  {mode_tag}{result.elapsed_ms}ms  ~{result.token_estimate} tokens  ──[/dim]'
+                )
+            console.print()
+
+        if result is None:
+            continue
 
         _save_session(engine, active_kb)
 
         logger.log_turn(
-            user_message=user_input,   # log original, not KB-augmented turn_input
+            user_message=user_input,
             response=result.response,
             legs_used=[o['leg'] for o in result.isolate_outputs],
             dead_legs=result.dead_legs,
             deep=result.deep,
             elapsed_ms=result.elapsed_ms,
         )
-
-        if result.dead_legs:
-            console.print(
-                f'[yellow]Leg(s) dropped this turn: '
-                f'{", ".join(result.dead_legs)}[/yellow]'
-            )
-
-        mode_tag = '[deep] ' if result.deep else ('[pipeline] ' if result.pipeline else '')
-        console.print(Panel(
-            result.response,
-            title=f'[bold green]MILNA  {mode_tag}[/bold green]'
-                  f'[dim]{result.elapsed_ms}ms  '
-                  f'~{result.token_estimate} tokens[/dim]',
-            border_style='green',
-            padding=(1, 2),
-        ))
-        console.print()
 
 
 async def main() -> None:
@@ -1150,13 +1468,14 @@ async def main() -> None:
     print_banner()
 
     inventory = KeyInventory()
+    license   = License()
 
     if args.add_key:
         add_key_flow(inventory)
         return
 
-    # Build legs from stored keys
-    registry = LegRegistry(inventory)
+    # Build legs from stored keys, capped by license tier
+    registry = LegRegistry(inventory, license=license)
     legs     = registry.build()
     _load_bench(registry)
 
@@ -1172,8 +1491,8 @@ async def main() -> None:
             legs = registry.build()
         console.print()
 
-    # Mode
-    mc = ModeController(args.mode)
+    # Mode — enforced by license tier
+    mc = ModeController(args.mode, license=license)
     console.print(f'[dim]Data dir: {data_dir}[/dim]')
     console.print(f'[dim]{mc.summary()}[/dim]')
     if registry.ollama_models:
@@ -1194,7 +1513,9 @@ async def main() -> None:
     rec_leg = (
         registry.legs.get('anthropic') or
         registry.legs.get('openai') or
-        registry.legs.get('ollama')
+        registry.legs.get('ollama') or
+        registry.legs.get('groq') or
+        next(iter(registry.legs.values()), None)
     )
     if not rec_leg:
         console.print('[red]No provider available for reconciler. Exiting.[/red]')
@@ -1215,7 +1536,7 @@ async def main() -> None:
         reconciler_fallbacks=rec_fallbacks,
     )
 
-    logger = SessionLogger(log_dir=str(LOG_DIR), license_id='trial')
+    logger = SessionLogger(log_dir=str(LOG_DIR), license_id=license.tier)
 
     show_legs(registry)
     console.print()
@@ -1236,7 +1557,7 @@ async def main() -> None:
 
     console.print('[dim]Type /help for commands. Type /deep before a message for full distillation.[/dim]\n')
 
-    await chat_loop(engine, inventory, registry, mc, logger, resume_kb=_resume_kb)
+    await chat_loop(engine, inventory, registry, mc, logger, resume_kb=_resume_kb, license=license)
     logger.log_end()
 
 

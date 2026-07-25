@@ -1,6 +1,7 @@
 """
 Kilonova ConversationEngine — the heart of Milna OS.
 
+
 Two execution strategies, chosen automatically each turn:
 
   Pipeline  (single provider, e.g. Ollama-only)
@@ -17,6 +18,7 @@ Two execution strategies, chosen automatically each turn:
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+from typing import AsyncIterator, Union
 from .legs import Leg, LegRegistry
 from .mode import ModeController
 from .reconciler import Reconciler
@@ -47,12 +49,17 @@ Do NOT suggest the user needs an external tool or interface. Milna handles it na
 
 ## Web access
 
-Web browsing and URL fetching are not yet available in this version of Milna. \
-When a user asks if you can read a website, say so directly and specifically: \
-"Web access is coming in a future update. For now, use /load or /ingest to bring \
-document content into context." \
-Do NOT say "I don't have the capability" or generic AI disclaimers. \
-Be specific: the feature is planned, not built yet.
+Milna has live web commands — do NOT tell users web access is unavailable:
+
+- `/fetch <url>` — fetches a web page into conversation context immediately
+- `/webseed <topic> <url>` — extracts entities from a page into a DOT knowledge base
+- `/webseed <topic> <url> --follow` — BFS crawls linked pages (depth 1, up to 20 by default)
+- `/webseed <topic> <url> --depth <n>` — crawls N levels deep
+- `/webseed <topic> <url> --force` — re-fetches all URLs, ignoring saved crawl state
+
+If a user asks whether you can read a website or browse the web, tell them to use \
+`/fetch` for single pages or `/webseed` to extract knowledge into a DOT. \
+Do NOT say web access is coming soon or not yet built — it is built and available now.
 
 ## What a DOT is
 
@@ -65,35 +72,48 @@ Treat DOT content as authoritative source material, not as something you need to
 - Answer directly and completely. Do not hedge about what you "can" or "cannot" do as an AI \
   — the runtime handles capabilities, you handle answers.
 - If information is in the context or KB, use it. If it is not, say so plainly: "I don't have that in my knowledge base." Do NOT fill gaps with training data presented as confirmed facts.
+- Never invent or estimate specific counts, records, entities, file sizes, or statistics for operations that have not been run. If the result is unknown say so — "run the command to find out" is the correct answer.
 - For lore, narrative, or world-building questions: answer from the loaded KB first. If the KB is silent on a detail, say so before offering general knowledge.
 - For code questions: write real, complete code. No placeholders.
 - For design questions: give a recommendation with a stated tradeoff, not a menu of options.
 - You know your own name. You know what you are. Answer questions about your identity accurately.
+- NEVER generate simulated conversations, fake user prompts, or multi-turn dialogue. Give one direct answer.
 """
 
 # Appended to the user message in pipeline mode — asks each isolate to self-note.
 _CARD_SUFFIX = (
     '\n\n[CARD]\n'
-    '• Claim: your direct answer in one sentence\n'
-    '• Facts: 2-3 key supporting points\n'
-    '• Confidence: high / medium / low\n'
-    '• Unique: one thing the other models might miss'
+    'Output ONLY a JSON object on a single line — no prose before or after:\n'
+    '{"claim":"one-sentence direct answer","facts":["point 1","point 2","point 3"],'
+    '"confidence":0.85,"unique":"one thing the other models might miss"}\n'
+    'confidence is a float 0.0–1.0.'
 )
 
 # System prompt for the card synthesis step in pipeline mode.
 _CARD_SYNTH_SYSTEM = (
-    'You are Milna. You have received note cards from AI models that each answered '
-    'the same question independently. Write one direct, complete answer synthesized '
-    'from the cards. Favor high-confidence claims. Include anything unique if it adds '
-    'value. Write as a confident assistant — no bullet lists, no meta-commentary about '
+    'You are Milna. You have received JSON note cards from AI models that each answered '
+    'the same question independently. Each card has: claim (one-sentence answer), '
+    'facts (supporting points), confidence (0.0-1.0 float), unique (novel observation). '
+    'Write one direct, complete answer synthesized from the cards. '
+    'Favor high-confidence claims. Include anything unique if it adds value. '
+    'Write as a confident assistant — no bullet lists, no meta-commentary about '
     'the cards or the process. Do NOT repeat the question.'
 )
 
 
 def _extract_card(text: str) -> str:
-    """Pull the [CARD] section out of an isolate response. Falls back to truncation."""
+    """Pull the [CARD] JSON from an isolate response. Falls back to text truncation."""
+    import json, re
     if '[CARD]' in text:
-        return text.split('[CARD]', 1)[1].strip()
+        card_section = text.split('[CARD]', 1)[1].strip()
+        m = re.search(r'\{[\s\S]*?\}', card_section)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+                return json.dumps(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return card_section[:400]
     return text[:400]
 
 
@@ -127,7 +147,7 @@ class ConversationEngine:
             provider=reconciler_provider,
             model=reconciler_model,
             roles=['coherence', 'structure', 'pattern_recognition',
-                   'data_validity', 'notes_taker'],
+                   'data_validity', 'notes_taker', 'curator'],
             fallback_providers=fallbacks,
         )
         self.judge = Reconciler(
@@ -151,7 +171,7 @@ class ConversationEngine:
             rolling = rolling[-max_msgs:]
         self.history = anchors + rolling
 
-    def _build_messages(self, user_message: str) -> list[dict]:
+    def _build_messages(self, user_message: str | list) -> list[dict]:
         return self.history + [{'role': 'user', 'content': user_message}]
 
     def _history_text(self) -> str:
@@ -172,10 +192,10 @@ class ConversationEngine:
     async def _fire_isolate(self, leg: Leg, messages: list[dict], system: str) -> dict:
         try:
             text = await leg.provider.complete(leg.model, system, messages)
-            return {'leg': leg.name, 'text': text, 'ok': True}
+            return {'leg': leg.name, 'text': text or '', 'ok': True}
         except Exception as e:
             err = str(e)
-            transient = any(c in err for c in ('429', '503', '502', 'rate', 'quota', 'timeout'))
+            transient = not err or any(c in err.lower() for c in ('429', '503', '502', 'rate', 'quota', 'timeout', 'timed out', 'readtimeout', 'connecttimeout'))
             if not transient:
                 self.registry.kill_leg(leg.name, err)
             return {'leg': leg.name, 'text': '', 'ok': False, 'error': err, 'transient': transient}
@@ -203,7 +223,8 @@ class ConversationEngine:
         messages = self._build_messages(user_message)
         # Only inject card format for conversation turns — ingest/tool calls
         # pass their own system prompts and need clean JSON output.
-        if system == MILNA_SYSTEM:
+        # Skip card suffix when content is a list (content blocks) since string concat would break.
+        if system == MILNA_SYSTEM and isinstance(messages[-1].get('content'), str):
             fire_messages = messages[:-1] + [{
                 'role': 'user',
                 'content': messages[-1]['content'] + _CARD_SUFFIX,
@@ -266,11 +287,145 @@ class ConversationEngine:
                 continue
         return isolate_outputs[0]['text']  # last-resort fallback
 
+    # ── Specialist round (build-time persona synthesis) ───────────────────────
+
+    async def specialist_round(
+        self,
+        user_prompt: str,
+        specialist_configs: dict[str, dict],
+        dot_content: str = '',
+    ) -> dict[str, dict]:
+        """
+        Fire multiple specialist providers in parallel, each with its own system
+        prompt, and return their structured JSON outputs for curator synthesis.
+
+        Used during GM Persona build-time. Does NOT mutate history — stateless.
+
+        Args:
+            user_prompt: shared analysis task
+            specialist_configs: role_id → {leg_name, system_prompt}
+            dot_content: prepended to the user prompt with clear delimiters
+
+        Returns:
+            role_id → {role, leg, text, artifact, ok, error?}
+        """
+        if dot_content.strip():
+            full_message = (
+                '=== DOCUMENT OF TRUTH (AUTHORITATIVE SOURCE) ===\n\n'
+                f'{dot_content}\n\n'
+                '=== END DOT ===\n\n'
+                '=== TASK ===\n\n'
+                f'{user_prompt}\n\n'
+                '=== END TASK ==='
+            )
+        else:
+            full_message = user_prompt
+
+        messages = [{'role': 'user', 'content': full_message}]
+
+        role_ids = list(specialist_configs.keys())
+        tasks = [
+            self._fire_specialist_isolate(
+                leg_name=cfg.get('leg_name', ''),
+                messages=messages,
+                system_prompt=cfg.get('system_prompt', ''),
+                role_id=role_id,
+            )
+            for role_id, cfg in specialist_configs.items()
+        ]
+
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+        output = {}
+        for role_id, result in zip(role_ids, results_list):
+            if isinstance(result, Exception):
+                output[role_id] = {
+                    'role':     role_id,
+                    'leg':      specialist_configs[role_id].get('leg_name', 'unknown'),
+                    'text':     '',
+                    'artifact': None,
+                    'ok':       False,
+                    'error':    str(result),
+                }
+            else:
+                output[role_id] = result
+        return output
+
+    async def _fire_specialist_isolate(
+        self,
+        leg_name: str,
+        messages: list[dict],
+        system_prompt: str,
+        role_id: str,
+    ) -> dict:
+        """Fire one specialist on a named leg. Returns result dict."""
+        leg = self.registry.legs.get(leg_name)
+        if not leg or not leg.alive:
+            return {
+                'role':     role_id,
+                'leg':      leg_name,
+                'text':     '',
+                'artifact': None,
+                'ok':       False,
+                'error':    f'Leg "{leg_name}" not available.',
+            }
+        try:
+            text = await leg.provider.complete(leg.model, system_prompt, messages)
+            artifact = None
+            try:
+                artifact = self._extract_json_artifact(text)
+            except Exception:
+                pass
+            return {
+                'role':     role_id,
+                'leg':      leg_name,
+                'text':     text,
+                'artifact': artifact,
+                'ok':       True,
+            }
+        except Exception as e:
+            err = str(e)
+            transient = not err or any(c in err.lower() for c in ('429', '503', '502', 'rate', 'quota', 'timeout', 'timed out', 'readtimeout', 'connecttimeout'))
+            if not transient:
+                self.registry.kill_leg(leg_name, err)
+            return {
+                'role':      role_id,
+                'leg':       leg_name,
+                'text':      '',
+                'artifact':  None,
+                'ok':        False,
+                'error':     err,
+                'transient': transient,
+            }
+
+    @staticmethod
+    def _extract_json_artifact(text: str) -> dict:
+        """Extract and parse a JSON artifact from model output, stripping markdown fences."""
+        import json
+        import re
+        clean = re.sub(r'```[a-zA-Z]*\s*', '', text.strip())
+        clean = clean.strip().strip('`').strip()
+        # Try direct parse
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            pass
+        # Find largest JSON object or array
+        for pattern in (r'\{[\s\S]*\}', r'\[[\s\S]*\]'):
+            matches = sorted(re.finditer(pattern, clean),
+                             key=lambda m: len(m.group()), reverse=True)
+            for m in matches:
+                try:
+                    return json.loads(m.group())
+                except json.JSONDecodeError:
+                    continue
+        raise ValueError('No valid JSON found in model output.')
+
     # ── Main turn ─────────────────────────────────────────────────────────────
 
     async def turn(
         self,
-        user_message: str,
+        user_message: str | list,
         system: str | None = None,
         deep: bool = False,
     ) -> TurnResult:
@@ -289,7 +444,8 @@ class ConversationEngine:
 
         for round_num in range(1, max_rounds + 1):
             round_message = user_message
-            if prev_synthesis and deep:
+            # Deep-round synthesis prefix: only supported when user_message is a plain string
+            if prev_synthesis and deep and isinstance(user_message, str):
                 round_message = (
                     f'{user_message}\n\n'
                     f'## PREVIOUS ROUND SYNTHESIS\n\n{prev_synthesis}'
@@ -320,12 +476,22 @@ class ConversationEngine:
                 response         = isolate_outputs[0]['text']
                 reconciler_roles = {'notes_taker': response}
                 prev_synthesis   = response
+            elif system != MILNA_SYSTEM:
+                # Tool/extraction call in parallel mode — reconciler output is unused
+                # (callers read isolate_outputs directly) so skip it entirely.
+                response         = isolate_outputs[0]['text']
+                reconciler_roles = {'notes_taker': response}
+                prev_synthesis   = response
             else:
                 reconciler_roles = await self.reconciler.run(
                     isolate_outputs,
                     conversation_context=self._history_text(),
                 )
-                prev_synthesis = reconciler_roles.get('notes_taker', isolate_outputs[0]['text'])
+                prev_synthesis = (
+                    reconciler_roles.get('curator') or
+                    reconciler_roles.get('notes_taker') or
+                    isolate_outputs[0]['text']
+                )
 
                 if deep and round_num < max_rounds:
                     judge_out = await self.judge.run(isolate_outputs)
@@ -333,14 +499,18 @@ class ConversationEngine:
                     if 'no further' in note.lower() or 'complete' in note.lower():
                         break
 
-        response = reconciler_roles.get('notes_taker', isolate_outputs[0]['text'])
+        response = (
+            reconciler_roles.get('curator') or
+            reconciler_roles.get('notes_taker') or
+            isolate_outputs[0]['text']
+        )
 
         self.history.append({'role': 'user',      'content': user_message})
         self.history.append({'role': 'assistant', 'content': response})
         self._trim_history()
 
         elapsed_ms     = int((datetime.now() - t_start).total_seconds() * 1000)
-        token_estimate = sum(len(o['text'].split()) * 4 // 3 for o in isolate_outputs)
+        token_estimate = sum(len((o['text'] or '').split()) * 4 // 3 for o in isolate_outputs)
 
         return TurnResult(
             response=response,
@@ -351,5 +521,108 @@ class ConversationEngine:
             elapsed_ms=elapsed_ms,
             deep=deep,
             rounds_run=round_num,
+            pipeline=pipeline,
+        )
+
+    # ── Streaming turn ────────────────────────────────────────────────────────
+
+    async def stream_turn(
+        self,
+        user_message: str,
+        system: str | None = None,
+    ) -> AsyncIterator[Union[str, TurnResult]]:
+        """
+        Single-round turn that streams the synthesis tokens as they arrive.
+
+        Yields str chunks while the model is generating, then yields one
+        TurnResult as the final item so the caller can log timing and metadata.
+        Deep-mode distillation is not supported here — use turn() for /deep.
+        """
+        if system is None:
+            system = MILNA_SYSTEM
+
+        t_start          = datetime.now()
+        isolates_per_leg = self.mode.mode.isolates_per_leg
+        pipeline         = self._is_pipeline_mode()
+
+        if pipeline:
+            isolate_outputs, dead = await self._pipeline_round(
+                user_message, system, isolates_per_leg)
+        else:
+            isolate_outputs, dead = await self._parallel_round(
+                user_message, system, isolates_per_leg)
+
+        if not isolate_outputs:
+            msg = 'All legs failed. Check your API keys and connections.'
+            yield msg
+            yield TurnResult(
+                response=msg, isolate_outputs=[], reconciler_roles={},
+                dead_legs=dead, token_estimate=0,
+                elapsed_ms=int((datetime.now() - t_start).total_seconds() * 1000),
+                pipeline=pipeline,
+            )
+            return
+
+        # ── Stream the synthesis step ─────────────────────────────────────────
+        reconciler_roles: dict[str, str] = {}
+        full_response = ''
+
+        if pipeline and any('card' in o for o in isolate_outputs):
+            cards_block = '\n\n---\n\n'.join(
+                f'### Card {i+1} ({o["leg"]})\n{o["card"]}'
+                for i, o in enumerate(isolate_outputs)
+            )
+            content = f'## NOTE CARDS\n\n{cards_block}'
+            streamed = False
+            for provider, model in self._rec_providers:
+                try:
+                    async for chunk in provider.stream(
+                        model,
+                        _CARD_SYNTH_SYSTEM,
+                        [{'role': 'user', 'content': content}],
+                    ):
+                        yield chunk
+                        full_response += chunk
+                    streamed = True
+                    break
+                except Exception:
+                    continue
+            if not streamed:
+                full_response = isolate_outputs[0]['text']
+                yield full_response
+            reconciler_roles = {'notes_taker': full_response}
+
+        elif pipeline:
+            full_response = isolate_outputs[0]['text']
+            yield full_response
+            reconciler_roles = {'notes_taker': full_response}
+
+        else:
+            # Parallel mode: run reconciler buffered, then yield the final answer
+            reconciler_roles = await self.reconciler.run(
+                isolate_outputs, conversation_context=self._history_text())
+            full_response = (
+                reconciler_roles.get('curator') or
+                reconciler_roles.get('notes_taker') or
+                isolate_outputs[0]['text']
+            )
+            yield full_response
+
+        self.history.append({'role': 'user',      'content': user_message})
+        self.history.append({'role': 'assistant', 'content': full_response})
+        self._trim_history()
+
+        elapsed_ms     = int((datetime.now() - t_start).total_seconds() * 1000)
+        token_estimate = sum(len((o['text'] or '').split()) * 4 // 3 for o in isolate_outputs)
+
+        yield TurnResult(
+            response=full_response,
+            isolate_outputs=isolate_outputs,
+            reconciler_roles=reconciler_roles,
+            dead_legs=list(set(dead)),
+            token_estimate=token_estimate,
+            elapsed_ms=elapsed_ms,
+            deep=False,
+            rounds_run=1,
             pipeline=pipeline,
         )

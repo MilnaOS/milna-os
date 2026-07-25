@@ -1,0 +1,16 @@
+name: kilonova_ondevice
+description: >
+  Milna OS: Artaxia — the on-device edition of the Kilonova orchestration
+  engine. Pure Dart, no Flutter dependency, so it works as a dependency for
+  any Flutter app (Soutuk, and later PB-AIM) without forcing UI coupling.
+version: 0.1.0
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  meta: ^1.15.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.6

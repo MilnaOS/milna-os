@@ -28,25 +28,35 @@ Milna fires your prompt across all active AI legs in parallel, reconciles their 
 ## Install
 
 ```bash
-git clone https://github.com/your-username/milna-os.git
-cd milna-os
-pip install -r requirements.txt
+pip install milna-os
 ```
+
+Python 3.11+ required. On Windows, keys are stored in Windows Credential Manager. On Mac/Linux, the OS keychain is used — never on disk in plaintext.
 
 ---
 
 ## Run
 
 ```bash
-python milna.py
+milna
 ```
 
-First run: Milna will prompt you to add an API key. Keys are stored in Windows Credential Manager (or the OS keychain on Mac/Linux).
+First run: Milna will prompt you to add an API key.
 
 To add or update a key at any time:
 
 ```bash
-python milna.py --add-key
+milna --add-key
+```
+
+---
+
+## Source
+
+```bash
+git clone https://github.com/MilnaOS/milna-os.git
+cd milna-os
+pip install -e .
 ```
 
 ---
@@ -57,6 +67,11 @@ python milna.py --add-key
 |---------|-------------|
 | `/load <path>` | Load a PDF, .md, or .txt file into conversation context |
 | `/load <folder>` | Pick from files in a folder |
+| `/fetch <url>` | Fetch a web page into conversation context |
+| `/webseed <topic> <url>` | Extract entities from a web page into a DOT |
+| `/webseed <topic> <url> --follow` | Crawl linked pages (depth 1, up to 20 by default) |
+| `/webseed <topic> <url> --depth <n>` | BFS crawl N levels deep |
+| `/webseed <topic> <url> --force` | Re-fetch all URLs, ignoring saved crawl state |
 | `/ingest <folder>` | Build a persistent knowledge base (DOT) from PDFs |
 | `/ingest <folder> --deep` | Deep distillation — richer extraction, higher cost |
 | `/ingest <folder> --topic <name>` | Custom topic name for the DOT |

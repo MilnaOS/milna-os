@@ -9,14 +9,42 @@ from .providers.anthropic_provider import AnthropicProvider
 from .providers.openai_provider import OpenAIProvider
 from .providers.ollama_provider import OllamaProvider
 from .providers.gemini_provider import GeminiProvider
+from .providers.groq_provider import GroqProvider
+from .providers.generic_provider import GenericProvider
+from .license import License
 
 SERVICE = 'milna_os'
 
 PROVIDER_DEFAULTS = {
-    'anthropic': 'claude-haiku-4-5',
-    'openai':    'gpt-4o-mini',
-    'gemini':    'gemini-2.5-flash',
-    'ollama':    'mistral',
+    'anthropic':  'claude-haiku-4-5-20251001',
+    'openai':     'gpt-4o-mini',
+    'gemini':     'gemini-2.5-flash',
+    'groq':       'llama-3.1-8b-instant',
+    'ollama':     'mistral',
+    # Free OpenAI-compatible providers
+    'cerebras':   'llama3.1-8b',
+    'openrouter': 'nvidia/nemotron-nano-9b-v2:free',
+    'together':   'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    'sambanova':  'Meta-Llama-3.3-70B-Instruct',
+    'mistral':    'mistral-small-latest',
+}
+
+# Base URLs for OpenAI-compatible providers
+_PROVIDER_URLS = {
+    'cerebras':   'https://api.cerebras.ai/v1',
+    'openrouter': 'https://openrouter.ai/api/v1',
+    'together':   'https://api.together.xyz/v1',
+    'sambanova':  'https://api.sambanova.ai/v1',
+    'mistral':    'https://api.mistral.ai/v1',
+}
+
+# Conservative request gaps (seconds) — stays within free-tier rate limits
+_PROVIDER_GAPS = {
+    'cerebras':   2.0,   # 30 RPM free tier
+    'openrouter': 1.0,   # polite default; free models have no hard limit
+    'together':   1.5,   # generous free credit
+    'sambanova':  2.0,   # 30 RPM free tier
+    'mistral':    1.5,   # free tier on La Plateforme
 }
 
 
@@ -46,11 +74,7 @@ class KeyInventory:
 
     def list_stored(self) -> list[str]:
         """Returns provider names that have keys stored."""
-        stored = []
-        for p in PROVIDER_DEFAULTS:
-            if self.get_key(p):
-                stored.append(p)
-        return stored
+        return [p for p in PROVIDER_DEFAULTS if self.get_key(p)]
 
 
 def probe_ollama(base_url: str = 'http://localhost:11434') -> list[str]:
@@ -76,9 +100,11 @@ class LegRegistry:
     A leg that fails is marked alive=False and dropped; others continue.
     """
 
-    def __init__(self, inventory: KeyInventory, ollama_url: str = 'http://localhost:11434'):
+    def __init__(self, inventory: KeyInventory, ollama_url: str = 'http://localhost:11434',
+                 license: License | None = None):
         self.inventory     = inventory
         self.ollama_url    = ollama_url
+        self.license       = license or License()
         self.legs:          dict[str, Leg] = {}
         self.ollama_models: list[str]      = []
         self.benched:       set[str]       = set()  # models excluded from pipeline
@@ -87,27 +113,35 @@ class LegRegistry:
         overrides = model_overrides or {}
         self.legs = {}
 
-        # Cloud legs — one per stored key
-        for provider_name in ['anthropic', 'openai', 'gemini']:
+        # Cloud legs — one per stored key, capped by license tier.
+        # Filter to providers that actually have keys before applying the cap so
+        # position in the list doesn't exclude a provider that is the only key stored.
+        native = ['anthropic', 'openai', 'gemini', 'groq']
+        generic = ['cerebras', 'openrouter', 'together', 'sambanova', 'mistral']
+        providers_with_keys = [p for p in (native + generic) if self.inventory.get_key(p)]
+        capped = providers_with_keys  # no cap on dev machine
+        for provider_name in capped:
             key = self.inventory.get_key(provider_name)
-            if not key:
-                continue
             model = overrides.get(provider_name, PROVIDER_DEFAULTS[provider_name])
             provider = self._make_provider(provider_name, key, model)
             self.legs[provider_name] = Leg(
                 name=provider_name, provider=provider, model=model)
 
-        # Ollama — probe first; only add if actually running
+        # Ollama — probe first; only add if actually running.
+        # If multiple models are installed, create one leg per model (up to 3)
+        # so parallel extraction gets genuinely diverse signal.
         self.ollama_models = probe_ollama(self.ollama_url)
         if self.ollama_models:
-            ollama_model = overrides.get('ollama', self.ollama_models[0])
-            self.legs['ollama'] = Leg(
-                name='ollama',
-                provider=OllamaProvider(base_url=self.ollama_url, model=ollama_model),
-                model=ollama_model,
-            )
+            active_models = self.ollama_models[:3]
+            for i, ollama_model in enumerate(active_models):
+                leg_name = 'ollama' if i == 0 else f'ollama_{i}'
+                self.legs[leg_name] = Leg(
+                    name=leg_name,
+                    provider=OllamaProvider(base_url=self.ollama_url, model=ollama_model),
+                    model=ollama_model,
+                )
 
-        return self.active_legs()
+        return self.license.apply_leg_cap(self.active_legs())
 
     def _make_provider(self, name: str, key: str, model: str) -> BaseProvider:
         if name == 'anthropic':
@@ -116,6 +150,18 @@ class LegRegistry:
             return OpenAIProvider(api_key=key, model=model)
         if name == 'gemini':
             return GeminiProvider(api_key=key, model=model)
+        if name == 'groq':
+            return GroqProvider(api_key=key, model=model)
+        if name in _PROVIDER_URLS:
+            extra = {'HTTP-Referer': 'https://aimstudio.app', 'X-Title': 'Kilonova'} if name == 'openrouter' else None
+            return GenericProvider(
+                api_key=key,
+                base_url=_PROVIDER_URLS[name],
+                model=model,
+                name=name,
+                min_gap=_PROVIDER_GAPS.get(name, 1.5),
+                extra_headers=extra,
+            )
         raise ValueError(f'Unknown provider: {name}')
 
     def active_legs(self) -> list[Leg]:

@@ -53,18 +53,50 @@ class _TextExtractor(HTMLParser):
         return raw.strip()
 
 
+_SKIP_EXTENSIONS = {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+                    '.zip', '.gz', '.tar', '.rar', '.7z', '.exe', '.dmg',
+                    '.mp3', '.mp4', '.wav', '.ogg', '.png', '.jpg', '.jpeg',
+                    '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.ttf'}
+
+_SKIP_CONTENT_TYPES = {
+    'application/pdf', 'application/msword', 'application/vnd.ms-',
+    'application/octet-stream', 'application/zip', 'application/x-',
+    'image/', 'audio/', 'video/', 'font/',
+}
+
+
+def _is_binary_content_type(ct: str) -> bool:
+    ct = ct.split(';')[0].strip().lower()
+    return any(ct.startswith(p) for p in _SKIP_CONTENT_TYPES)
+
+
 def fetch_url(url: str, timeout: float = 15.0) -> dict:
     """
     Fetch a URL and return clean text.
     Returns {'ok': True, 'text': ..., 'url': ..., 'words': N}
            {'ok': False, 'error': ..., 'url': ...}
+    Skips binary files (PDF, images, archives, etc.) by URL extension and content-type.
     """
+    # Fast skip by URL extension — avoids downloading binary files at all
+    url_path = urlparse(url).path.lower()
+    ext = Path(url_path).suffix
+    if ext in _SKIP_EXTENSIONS:
+        return {'ok': False, 'error': f'Skipped binary file ({ext})', 'url': url}
+
     try:
         headers = {'User-Agent': 'Milna/1.0 (research tool; +https://github.com/milna-os)'}
-        response = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        # Separate connect vs read timeouts — long connect hangs are rare but reads on
+        # large binary responses can block forever without a read timeout cap.
+        http_timeout = httpx.Timeout(timeout, connect=10.0, read=timeout)
+        response = httpx.get(url, headers=headers, timeout=http_timeout, follow_redirects=True)
         response.raise_for_status()
 
         content_type = response.headers.get('content-type', '')
+
+        # Skip binary content-types before touching response body
+        if _is_binary_content_type(content_type):
+            return {'ok': False, 'error': f'Skipped binary content-type ({content_type.split(";")[0].strip()})', 'url': url}
+
         if 'html' in content_type:
             parser = _TextExtractor()
             parser.feed(response.text)
@@ -84,6 +116,8 @@ def fetch_url(url: str, timeout: float = 15.0) -> dict:
         }
     except httpx.HTTPStatusError as e:
         return {'ok': False, 'error': f'HTTP {e.response.status_code}', 'url': url}
+    except httpx.TimeoutException:
+        return {'ok': False, 'error': 'Timeout', 'url': url}
     except httpx.RequestError as e:
         return {'ok': False, 'error': str(e), 'url': url}
     except Exception as e:

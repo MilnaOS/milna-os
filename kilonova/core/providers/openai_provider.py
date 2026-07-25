@@ -1,3 +1,4 @@
+from typing import AsyncIterator
 from openai import AsyncOpenAI
 from .base import BaseProvider
 
@@ -24,6 +25,19 @@ class OpenAIProvider(BaseProvider):
             max_tokens=4096,
         )
         return response.choices[0].message.content
+
+    async def stream(self, model: str, system: str, messages: list[dict]) -> AsyncIterator[str]:
+        all_messages = [{'role': 'system', 'content': system}] + messages
+        async with await self.client.chat.completions.create(
+            model=model or self.default_model,
+            messages=all_messages,
+            max_tokens=4096,
+            stream=True,
+        ) as s:
+            async for chunk in s:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
 
     async def count_tokens(self, model: str, system: str, messages: list[dict]) -> int:
         # OpenAI doesn't have a dedicated count endpoint — use tiktoken estimate

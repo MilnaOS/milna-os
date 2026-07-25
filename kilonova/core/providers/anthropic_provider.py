@@ -1,4 +1,5 @@
 import anthropic
+from typing import AsyncIterator
 from .base import BaseProvider
 
 
@@ -20,15 +21,30 @@ class AnthropicProvider(BaseProvider):
         response = await self.client.messages.create(
             model=model or self.default_model,
             max_tokens=4096,
-            system=system,
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
         )
         return response.content[0].text
 
+    async def stream(
+        self,
+        model: str,
+        system: str,
+        messages: list[dict],
+    ) -> AsyncIterator[str]:
+        async with self.client.messages.stream(
+            model=model or self.default_model,
+            max_tokens=4096,
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            messages=messages,
+        ) as s:
+            async for chunk in s.text_stream:
+                yield chunk
+
     async def count_tokens(self, model: str, system: str, messages: list[dict]) -> int:
         response = await self.client.messages.count_tokens(
             model=model or self.default_model,
-            system=system,
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
         )
         return response.input_tokens

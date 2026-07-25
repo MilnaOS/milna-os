@@ -26,11 +26,28 @@ Usage from milna.py:
 import asyncio
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
-from .loader import load_file, list_folder, extract_pdf_pages, DEFAULT_BUDGET
+from .loader import load_file, list_folder, extract_pdf_pages, classify_pdf_pages, DEFAULT_BUDGET
 from .kb_tape import tag_setting
+
+
+def _acquire_index_lock(index_path: Path, timeout: int = 30) -> None:
+    lock = index_path.with_suffix('.lock')
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            lock.open('x').close()
+            return
+        except FileExistsError:
+            time.sleep(0.2)
+    raise TimeoutError(f'Index lock timeout: {index_path}')
+
+
+def _release_index_lock(index_path: Path) -> None:
+    index_path.with_suffix('.lock').unlink(missing_ok=True)
 
 
 # For ingestion we want more content per document than a chat /load
@@ -91,18 +108,25 @@ DISTILLED DOCUMENT:
 
 EXTRACT_SYSTEM = """You are a data extraction engine.
 You will read source material and extract concrete entity records matching a given schema.
-Output ONLY valid JSON. No prose, no markdown fences."""
+Output ONLY a valid JSON array. Start your response with [ and end with ]. No prose, no markdown, no code fences."""
 
-EXTRACT_USER = """Extract all {entity_type} entities from the text below.
+# Stable prefix — entity type + schema — cached across all chunks for the same entity type
+EXTRACT_PREFIX = """Extract all {entity_type} entities mentioned in the source text.
 
-Schema for {entity_type}:
+Schema (use these field names exactly):
 {schema}
 
-Output a JSON array of objects. Each object must match the schema fields.
-If a field is unknown, use null. Do not invent data not present in the source.
+Rules:
+- Output a JSON array. If you find entities, output [{{"name": "...", ...}}, ...]. If none found, output [].
+- Fill every field you can from the text. Use null for any field not mentioned.
+- Partial records are welcome — a record with just a name and one other field is better than nothing.
+- Do not add fields not in the schema."""
 
-SOURCE TEXT:
-{text}"""
+# Variable suffix — just the source chunk; changes every call
+EXTRACT_SUFFIX = """\n\nSOURCE TEXT:\n{text}"""
+
+# Legacy single-string format kept for callers that haven't been updated
+EXTRACT_USER = EXTRACT_PREFIX + EXTRACT_SUFFIX
 
 OVERVIEW_SYSTEM = """You are a research synthesizer.
 Write a comprehensive overview document from a set of distilled source summaries.
@@ -163,12 +187,79 @@ class Ingestor:
             parts.append(result.response)
         return '\n\n---\n\n'.join(parts)
 
+    async def _distill_smart(self, path: Path, doc_name: str, deep: bool = False,
+                              progress_cb=None) -> tuple[str, int, int]:
+        """
+        Differential distillation — only burns API credits where actually needed.
+
+        Classify every page:
+          prose       → paste raw text directly (free)
+          clean_table → paste text + rendered markdown table (free)
+          needs_llm   → batch and send to distillation LLM (API call)
+
+        Consecutive needs_llm pages are grouped into batches (≤ 8 pages) to
+        minimise API calls. Returns (distilled_text, llm_pages, total_pages).
+        """
+        def _prog(msg: str):
+            if progress_cb:
+                progress_cb(msg)
+
+        pages = classify_pdf_pages(path)
+        if not pages:
+            return '', 0, 0
+
+        total_pages = len(pages)
+        llm_pages   = sum(1 for p in pages if p['type'] == 'needs_llm')
+        free_pages  = total_pages - llm_pages
+
+        _prog(f'  {doc_name}: {total_pages} pages — '
+              f'{free_pages} free ({round(free_pages/total_pages*100)}%), '
+              f'{llm_pages} LLM ({round(llm_pages/total_pages*100)}%)')
+
+        output_parts: list[str] = []
+        llm_batch:    list[dict] = []
+
+        async def _flush_batch() -> None:
+            if not llm_batch:
+                return
+            combined  = '\n\n'.join(
+                f'[Page {p["page_num"] + 1}]\n{p["text"]}' for p in llm_batch
+            )
+            user_msg  = DISTILL_USER.format(text=combined[:12000])
+            result    = await self.engine.turn(user_msg, system=DISTILL_SYSTEM, deep=deep)
+            self.engine.reset()
+            output_parts.append(result.response)
+            llm_batch.clear()
+
+        for page in pages:
+            if page['type'] == 'needs_llm':
+                llm_batch.append(page)
+                if len(llm_batch) >= 8:
+                    await _flush_batch()
+            else:
+                await _flush_batch()
+                parts = [page['text']]
+                if page['tables_md']:
+                    parts.append(page['tables_md'])
+                output_parts.append('\n\n'.join(p for p in parts if p))
+
+        await _flush_batch()
+
+        return '\n\n---\n\n'.join(p for p in output_parts if p.strip()), llm_pages, total_pages
+
     async def _extract_schemas(self, distilled: str) -> dict:
         """Ask the engine to derive entity schemas from distilled text."""
         user_msg = SCHEMA_USER.format(text=distilled[:8000])
         result = await self.engine.turn(user_msg, system=SCHEMA_SYSTEM, deep=False)
         self.engine.reset()
-        return _parse_json_safe(result.response, default={})
+        # Use isolate outputs directly — reconciler synthesizes prose and destroys JSON
+        candidates = [o['text'] for o in result.isolate_outputs] if result.isolate_outputs else [result.response]
+        schemas = {}
+        for candidate in candidates:
+            parsed = _parse_json_safe(candidate, default={})
+            if isinstance(parsed, dict):
+                schemas.update(parsed)
+        return schemas
 
     async def _extract_entities(self, entity_type: str, schema: dict, text: str, deep: bool = False) -> list[dict]:
         """
@@ -188,13 +279,19 @@ class Ingestor:
             if pos >= len(text):
                 break
 
+        # Build a stable prefix (schema + instructions) once per entity type — cached.
+        # Only the source text chunk changes per call.
+        cached_prefix = EXTRACT_PREFIX.format(
+            entity_type=entity_type,
+            schema=json.dumps(schema, indent=2),
+        )
+
         for chunk in chunks:
-            user_msg = EXTRACT_USER.format(
-                entity_type=entity_type,
-                schema=json.dumps(schema, indent=2),
-                text=chunk,
-            )
-            result = await self.engine.turn(user_msg, system=EXTRACT_SYSTEM, deep=deep)
+            user_content = [
+                {'type': 'text', 'text': cached_prefix, 'cache_control': {'type': 'ephemeral'}},
+                {'type': 'text', 'text': EXTRACT_SUFFIX.format(text=chunk)},
+            ]
+            result = await self.engine.turn(user_content, system=EXTRACT_SYSTEM, deep=deep)
             self.engine.reset()
             # Use raw per-leg outputs — the reconciler synthesizes prose and destroys JSON.
             # Parse each leg's output independently and accumulate; dedup handles overlaps.
@@ -239,6 +336,27 @@ class Ingestor:
             )
         return response
 
+    async def rebuild_overview_only(self, topic: str, progress_cb=None) -> dict:
+        """Regenerate just overview.md from existing raw docs. Fast — one API call."""
+        def _progress(msg: str):
+            if progress_cb:
+                progress_cb(msg)
+
+        kb_dir = self._kb_dir(topic)
+        raw_dir = kb_dir / 'raw'
+        if not raw_dir.exists() or not list(raw_dir.glob('*.md')):
+            return {'ok': False, 'error': f'No raw docs found for topic: {topic}'}
+
+        raw_files = sorted(raw_dir.glob('*.md'))
+        _progress(f'Loading {len(raw_files)} raw docs...')
+        summaries = [f.read_text(encoding='utf-8') for f in raw_files]
+
+        _progress('Synthesizing overview...')
+        overview = await self._build_overview(topic, summaries)
+        (kb_dir / 'overview.md').write_text(overview, encoding='utf-8')
+        _progress('Overview written.')
+        return {'ok': True, 'topic': topic, 'docs': len(raw_files)}
+
     async def rebuild_from_raw(
         self,
         topic: str,
@@ -267,7 +385,7 @@ class Ingestor:
 
         distilled_docs = []
         for f in raw_files:
-            text = f.read_text(encoding='utf-8')
+            text = f.read_text(encoding='utf-8', errors='ignore')
             distilled_docs.append({'name': f.stem, 'stem': f.stem, 'text': text})
             _progress(f'Loaded raw: {f.name}')
 
@@ -334,7 +452,11 @@ class Ingestor:
                 name = record.get('name') or record.get('id') or f'record_{len(all_records)}'
                 record_path = entity_dir / f'{_safe_name(str(name))}.json'
                 record_path.write_text(json.dumps(record, indent=2), encoding='utf-8')
-            index_path.write_text(json.dumps(all_records, indent=2), encoding='utf-8')
+            _acquire_index_lock(index_path)
+            try:
+                index_path.write_text(json.dumps(all_records, indent=2), encoding='utf-8')
+            finally:
+                _release_index_lock(index_path)
             total_records += len(all_records)
             _progress(f'  {entity_type}: {len(all_records)} records')
             if progress_tick:
@@ -412,27 +534,27 @@ class Ingestor:
 
             _progress(f'Reading {f.name}...')
 
-            # Large files get chunked page-by-page so entities don't blur together
-            size_mb = f.stat().st_size / 1_048_576
-            if size_mb > 5.0:
+            if f.suffix.lower() == '.pdf':
+                # Smart differential distillation — free for prose/tables, LLM only for complex pages
                 mode_tag = ' [deep]' if deep_distill else ''
-                _progress(f'Chunked distillation{mode_tag}: {f.name} ({size_mb:.1f} MB)...')
-                distilled = await self._distill_chunked(f, f.name, deep=deep_distill)
+                _progress(f'Classifying{mode_tag} {f.name}...')
+                distilled, llm_pages, total_pages = await self._distill_smart(
+                    f, f.name, deep=deep_distill, progress_cb=_progress)
                 if not distilled:
                     _progress(f'  Skipped {f.name}: no extractable text')
                     continue
                 words_used = len(distilled.split())
-                truncated = False
+                truncated  = False
             else:
+                # Plain text / markdown — read directly, no distillation needed
                 loaded = load_file(f, budget_words=INGEST_WORD_BUDGET)
                 if not loaded['ok']:
                     _progress(f'  Skipped {f.name}: {loaded["error"]}')
                     continue
-                mode_tag = ' [deep]' if deep_distill else ''
-                _progress(f'Distilling{mode_tag} {f.name} ({loaded["words_used"]:,} words)...')
-                distilled = await self._distill_document(loaded['text'], f.name, deep=deep_distill)
+                _progress(f'Loaded {f.name} ({loaded["words_used"]:,} words)')
+                distilled  = loaded['text']
                 words_used = loaded['words_used']
-                truncated = loaded['truncated']
+                truncated  = loaded['truncated']
 
             # Write raw distilled text
             raw_path.write_text(distilled, encoding='utf-8')
@@ -507,19 +629,31 @@ class Ingestor:
             # Deduplicate against existing + new
             all_records = _deduplicate(all_records)
 
-            # Write only new records to disk
+            # Write new records; overwrite existing ones whose content changed
             new_count = 0
+            updated_count = 0
             for record in all_records:
                 name = record.get('name') or record.get('id') or f'record_{len(all_records)}'
+                record_path = entity_dir / f'{_safe_name(str(name))}.json'
+                new_content = json.dumps(record, indent=2)
                 if name not in existing_names:
-                    record_path = entity_dir / f'{_safe_name(str(name))}.json'
-                    record_path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+                    record_path.write_text(new_content, encoding='utf-8')
                     new_count += 1
+                elif not record_path.exists() or record_path.read_text(encoding='utf-8') != new_content:
+                    record_path.write_text(new_content, encoding='utf-8')
+                    updated_count += 1
 
-            index_path.write_text(json.dumps(all_records, indent=2), encoding='utf-8')
+            _acquire_index_lock(index_path)
+            try:
+                index_path.write_text(json.dumps(all_records, indent=2), encoding='utf-8')
+            finally:
+                _release_index_lock(index_path)
             total_records += len(all_records)
             if existing_records:
-                _progress(f'  {entity_type}: {len(existing_records)} existing + {new_count} new = {len(all_records)} total')
+                parts_msg = [f'{new_count} new']
+                if updated_count:
+                    parts_msg.append(f'{updated_count} updated')
+                _progress(f'  {entity_type}: {len(existing_records)} existing + {", ".join(parts_msg)} = {len(all_records)} total')
             else:
                 _progress(f'  {entity_type}: {len(all_records)} records')
 
@@ -594,14 +728,15 @@ def _safe_name(name: str) -> str:
 
 
 def _deduplicate(records: list[dict]) -> list[dict]:
-    """Deduplicate by name/id — last occurrence wins so newer extractions update stale ones."""
+    """Deduplicate by name/id (case-insensitive) — last occurrence wins."""
     seen: dict[str, int] = {}
     out: list[dict] = []
     for r in records:
-        key = r.get('name') or r.get('id')
+        raw_key = r.get('name') or r.get('id')
+        key = str(raw_key).strip().lower() if raw_key else None
         if key:
             if key in seen:
-                out[seen[key]] = r  # overwrite with newer record
+                out[seen[key]] = r
             else:
                 seen[key] = len(out)
                 out.append(r)
